@@ -1811,15 +1811,51 @@ run:
           UPDATE_PC_AND_CONTINUE(1);
       }
 
-      /* monitorenter and monitorexit for locking/unlocking an object */
 
-      CASE(_monitorenter): {
+      // monitorenter 进入的位置
+      CASE(_monitorenter):
+        // 获取锁对象
         oop lockee = STACK_OBJECT(-1);
-        // derefing's lockee ought to provoke implicit null check
+
+        // 触发 null 检查
         CHECK_NULL(lockee);
-        // find a free monitor or one already allocated for this object
-        // if we find a matching object then we need a new monitor
-        // since this is recursive enter
+
+        /**
+         * 找到一个空闲的 monitor 或者一个已经分配给当前对象的 monitor
+         * 如果我们找到一个匹配的对象，我们就需要一个新的 monitor
+         * 因为这是递归进入（重入）
+         *
+         * 类 BasicObjectLock，包含对象头和对象的整体结构
+         * class BasicObjectLock {
+         *   private:
+         *     BasicLock _lock;
+         *     oop _obj;
+         * }
+         *
+         * 类 BasicLock，实现类似对象头的结构
+         * class BasicLock {
+         *   private:
+         *     volatile markOop _displaced_header;
+         * }
+         *
+         * _monitor_base: base of monitors on the native stack
+         * 指向本地栈底层地址的指针
+         * 本机方法执行所需的堆栈
+         * inline BasicObjectLock* monitor_base() {
+         *   return _monitor_base;
+         * }
+         *
+         * _stack_base: base of expression stack
+         * 指向操作数栈的底层地址的指针
+         * HotSpot VM 里把 operand stack 叫做 expression stack
+         * 因为 operand stack 通常只在表达式求值过程中才有内容
+         * inline intptr_t* stack_base() {
+         *   return _stack_base;
+         * }
+         *
+         * displaced_header 就是 Lock Record (Mark Word)
+         */
+        // 获取本地栈中的底层 monitor 指针
         BasicObjectLock* limit = istate->monitor_base();
         BasicObjectLock* most_recent = (BasicObjectLock*) istate->stack_base();
         BasicObjectLock* entry = NULL;

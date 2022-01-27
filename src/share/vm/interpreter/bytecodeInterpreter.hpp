@@ -88,6 +88,10 @@ union frame_manager_message {
   osr_result _osr_result;           // result of OSR request
 };
 
+/**
+ * 大部分 C++ 对象的基类之一
+ * StackObj 只能在栈上分配，
+ */
 class BytecodeInterpreter : StackObj {
 friend class SharedRuntime;
 friend class AbstractInterpreterGenerator;
