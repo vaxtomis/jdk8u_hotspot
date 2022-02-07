@@ -1825,60 +1825,80 @@ run:
          * 如果我们找到一个匹配的对象，我们就需要一个新的 monitor
          * 因为这是递归进入（重入）
          *
-         * 类 BasicObjectLock，包含对象头和对象的整体结构
+         * 类 BasicObjectLock，包含对象头和对象的整体结构，也叫 Lock Record
          * class BasicObjectLock {
          *   private:
+         *     // 对象头的 Mark Word (displaced_hdr)
          *     BasicLock _lock;
+         *     // 持有该锁的对象指针 (owner)
          *     oop _obj;
          * }
          *
-         * 类 BasicLock，实现类似对象头的结构
+         * 类 BasicLock，实现类似对象头的结构，就是 Mark Word
          * class BasicLock {
          *   private:
          *     volatile markOop _displaced_header;
          * }
          *
-         * _monitor_base: base of monitors on the native stack
-         * 指向本地栈底层地址的指针
-         * 本机方法执行所需的堆栈
+         * 指向栈帧中 monitor 起始位置的指针
+         * Lock Record 存放在栈帧的顶部，内存地址高位
          * inline BasicObjectLock* monitor_base() {
+         *   // base of monitors on the native stack
          *   return _monitor_base;
          * }
          *
-         * _stack_base: base of expression stack
-         * 指向操作数栈的底层地址的指针
-         * HotSpot VM 里把 operand stack 叫做 expression stack
-         * 因为 operand stack 通常只在表达式求值过程中才有内容
+         * 指向栈帧中操作数栈的起始位置的指针
+         * 栈帧中内存地址由高到低，操作数栈处内存地址低位，栈帧底部
          * inline intptr_t* stack_base() {
+         *   // base of expression stack
          *   return _stack_base;
          * }
          *
-         * displaced_header 就是 Lock Record (Mark Word)
+         * HotSpot 中的虚拟机栈和本地方法栈共享一个栈
          */
-        // 获取本地栈中的底层 monitor 指针
+        // 获取（本地方法）栈帧中 monitor block 的起始位置（Local Record 的位置）
         BasicObjectLock* limit = istate->monitor_base();
+        // 获取操作数栈中的底部指针
         BasicObjectLock* most_recent = (BasicObjectLock*) istate->stack_base();
         BasicObjectLock* entry = NULL;
-        while (most_recent != limit ) {
+        // 当操作数栈指针指向 monitor 不为 Local Record 时
+        while (most_recent != limit) {
+          // 如果 most_recent 锁记录的 owner 为空，则把进入锁记录设置为 most_recent
           if (most_recent->obj() == NULL) entry = most_recent;
+
+          // 如果 most_recent 锁记录的 owner 为当前锁对象，跳出
           else if (most_recent->obj() == lockee) break;
+
+          // 将 most_recent 增加，继续搜寻下一条锁记录，直到达到 limit
           most_recent++;
         }
+        // 如果 entry 标记的锁记录不为空
         if (entry != NULL) {
+          // 将锁记录的 owner 设定为当前锁对象
           entry->set_obj(lockee);
           int success = false;
+
           uintptr_t epoch_mask_in_place = (uintptr_t)markOopDesc::epoch_mask_in_place;
 
+          // 获取锁对象的对象头信息（markOop 对象头）
           markOop mark = lockee->mark();
           intptr_t hash = (intptr_t) markOopDesc::no_hash;
           // implies UseBiasedLocking
+          // 是否禁用偏向锁
           if (mark->has_bias_pattern()) {
+            // 线程id
             uintptr_t thread_ident;
+            // 预期偏差锁定值
             uintptr_t anticipated_bias_locking_value;
+            // 获取当前线程 id
             thread_ident = (uintptr_t)istate->thread();
             anticipated_bias_locking_value =
-              (((uintptr_t)lockee->klass()->prototype_header() | thread_ident) ^ (uintptr_t)mark) &
-              ~((uintptr_t) markOopDesc::age_mask_in_place);
+              // 1. 对当前锁对象的 class原型对象头 和 线程id 进行 或 运算
+              (((uintptr_t)lockee->klass()->prototype_header() | thread_ident)
+              // 2. 拿生成的偏向当前线程的 Mark Word 和 当前锁对象进行 异或 运算
+              ^ (uintptr_t)mark)
+              // 3. 将拿到 Mark Word为...00001111000取反后变为...11110000111，再和前面进行与运算
+              & ~((uintptr_t) markOopDesc::age_mask_in_place);
 
             if  (anticipated_bias_locking_value == 0) {
               // already biased towards this thread, nothing to do
