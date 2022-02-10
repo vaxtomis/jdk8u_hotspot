@@ -1828,42 +1828,42 @@ run:
          * 类 BasicObjectLock，包含对象头和对象的整体结构，也叫 Lock Record
          * class BasicObjectLock {
          *   private:
-         *     // 对象头的 Mark Word (displaced_hdr)
+         *     // 对象头
          *     BasicLock _lock;
          *     // 持有该锁的对象指针 (owner)
          *     oop _obj;
          * }
          *
-         * 类 BasicLock，实现类似对象头的结构，就是 Mark Word
+         * 类 BasicLock，实现对象头
          * class BasicLock {
          *   private:
          *     volatile markOop _displaced_header;
          * }
          *
-         * 指向栈帧中 monitor 起始位置的指针
-         * Lock Record 存放在栈帧的顶部，内存地址高位
+         * 指向栈帧中 Lock Record 起始位置
          * inline BasicObjectLock* monitor_base() {
          *   // base of monitors on the native stack
          *   return _monitor_base;
          * }
          *
          * 指向栈帧中操作数栈的起始位置的指针
-         * 栈帧中内存地址由高到低，操作数栈处内存地址低位，栈帧底部
          * inline intptr_t* stack_base() {
          *   // base of expression stack
          *   return _stack_base;
          * }
          *
          * HotSpot 中的虚拟机栈和本地方法栈共享一个栈
+         * 当前帧的操作数栈始终位于栈的顶部
          */
-        // 获取（本地方法）栈帧中 monitor block 的起始位置（Local Record 的位置）
+        // 获取栈帧中 Local Record 的起始位置
         BasicObjectLock* limit = istate->monitor_base();
-        // 获取操作数栈中的底部指针
+        // 获取操作数栈中的起始位置指针
         BasicObjectLock* most_recent = (BasicObjectLock*) istate->stack_base();
         BasicObjectLock* entry = NULL;
-        // 当操作数栈指针指向 monitor 不为 Local Record 时
+        // 指针由内存地址低处慢慢上升（从靠近栈顶处慢慢下降，因为操作数栈比 Lock Record 更接近栈顶）
+        // 用于拿到一个空闲的锁记录
         while (most_recent != limit) {
-          // 如果 most_recent 锁记录的 owner 为空，则把进入锁记录设置为 most_recent
+          // 如果 most_recent 锁记录的 owner 为空，则先拿到空闲的锁记录
           if (most_recent->obj() == NULL) entry = most_recent;
 
           // 如果 most_recent 锁记录的 owner 为当前锁对象，跳出
@@ -1880,7 +1880,7 @@ run:
 
           uintptr_t epoch_mask_in_place = (uintptr_t)markOopDesc::epoch_mask_in_place;
 
-          // 获取锁对象的对象头信息（markOop 对象头）
+          // 获取锁对象的对象头（主要存储了 Mark Word）
           markOop mark = lockee->mark();
           intptr_t hash = (intptr_t) markOopDesc::no_hash;
           // implies UseBiasedLocking
@@ -1888,31 +1888,56 @@ run:
           if (mark->has_bias_pattern()) {
             // 线程id
             uintptr_t thread_ident;
-            // 预期偏差锁定值
+            // 预期偏向锁值
             uintptr_t anticipated_bias_locking_value;
             // 获取当前线程 id
             thread_ident = (uintptr_t)istate->thread();
+
             anticipated_bias_locking_value =
-              // 1. 对当前锁对象的 class原型对象头 和 线程id 进行 或 运算
+              // 1. 对当前锁对象 class 的 prototype_header 和 线程id 进行 或运算
+              // prototype_header (epoch + 分代年龄 + 锁偏向标志 + 锁标志位)
               (((uintptr_t)lockee->klass()->prototype_header() | thread_ident)
-              // 2. 拿生成的偏向当前线程的 Mark Word 和 当前锁对象进行 异或 运算
+              // 2. 拿锁对象的 对象头 进行 异或运算
               ^ (uintptr_t)mark)
-              // 3. 将拿到 Mark Word为...00001111000取反后变为...11110000111，再和前面进行与运算
+              // 3. 获取 age_mask_in_place 掩码，取反并与 之前的运算结果进行 与运算
               & ~((uintptr_t) markOopDesc::age_mask_in_place);
 
+            // 偏向的线程是否为当前线程
             if  (anticipated_bias_locking_value == 0) {
               // already biased towards this thread, nothing to do
+              // 打印偏向锁定统计信息
               if (PrintBiasedLockingStatistics) {
                 (* BiasedLocking::biased_lock_entry_count_addr())++;
               }
               success = true;
             }
+            // 预期偏向锁值 与 biased_lock_mask_in_place 做 与运算（忽略我们不在意的部分）
+            // 不为 0 表示 prototype_header 不是偏向模式
             else if ((anticipated_bias_locking_value & markOopDesc::biased_lock_mask_in_place) != 0) {
               // try revoke bias
+              // 获取 锁对象 的原型对象头
               markOop header = lockee->klass()->prototype_header();
+              // 如果 hash 不为 0（这里 no_hash = 0），则对 对象头做处理 并返回
               if (hash != markOopDesc::no_hash) {
                 header = header->copy_set_hash(hash);
               }
+              /**
+               * CAS 操作
+               * Atomic::cmpxchg_ptr(intptr_t exchange, volatile intptr_t* dest, intptr_t compare)
+               * 将 dest* 指向的内容和 compare 比较
+               * 如果相同，则将 exchange 写入 dest* 指向的内容，返回没变动的 compare
+               * 如果不同，则将 dest* 指向的内容写入 compare，并返回 compare (mark)
+               *
+               * 所以这里 if() 中如果为 true 则表示更变成功
+               * false 表示更变失败
+               *
+               * 当前作用：
+               * 将 lockee->mark_addr() 指向的内容和 mark 比较
+               * 如果相同，header 写入 lockee->mark_addr()，true
+               * 如果不同，将 lockee->mark_addr() 内容写入 mark，false
+               *
+               * 也就是尝试将 锁对象保存的 Mark Word 替换为当前对象头的 Mark Word
+               */
               if (Atomic::cmpxchg_ptr(header, lockee->mark_addr(), mark) == mark) {
                 if (PrintBiasedLockingStatistics)
                   (*BiasedLocking::revoked_lock_entry_count_addr())++;
