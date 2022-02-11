@@ -151,6 +151,7 @@ class markOopDesc: public oopDesc {
 #ifdef _WIN64
     // These values are too big for Win64
     const static uintptr_t hash_mask = right_n_bits(hash_bits);
+    // address_word 无符号整数，保存一个指针
     const static uintptr_t hash_mask_in_place  =
                             (address_word)hash_mask << hash_shift;
 #endif
@@ -300,7 +301,11 @@ class markOopDesc: public oopDesc {
     *(markOop*)ptr = m;
   }
   markOop copy_set_hash(intptr_t hash) const {
+    // value(): return (uintptr_t) this;
+    // 获取当前对象头的 无符号地址 和 hash_mask_in_place 取反后进行与运算
+    // 也就是 tmp 中 hash 部分被置 0
     intptr_t tmp = value() & (~hash_mask_in_place);
+    // 通过或操作，将 hash 中对应部分赋到 tmp 中（正好补上刚刚被置 0 的位置）
     tmp |= ((hash & hash_mask) << hash_shift);
     return (markOop)tmp;
   }

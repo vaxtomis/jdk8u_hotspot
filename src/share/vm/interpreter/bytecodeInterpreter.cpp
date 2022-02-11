@@ -1919,14 +1919,22 @@ run:
               markOop header = lockee->klass()->prototype_header();
               // 如果 hash 不为 0（这里 no_hash = 0），则对 对象头做处理 并返回
               if (hash != markOopDesc::no_hash) {
+                /**
+                 * copy_set_hash 大致操作为
+                 * 获取当前对象头的无符号地址 tmp，将 hash_mask_in_place 取反后，进行与运算
+                 * 也就是 tmp 中 hash 部分被置 0
+                 * 通过或操作，将 hash 中对应部分赋到 tmp 中（正好补上刚刚被置 0 的位置）
+                 * 返回 tmp
+                 * 由此获得一个新 header
+                 */
                 header = header->copy_set_hash(hash);
               }
               /**
                * CAS 操作
                * Atomic::cmpxchg_ptr(intptr_t exchange, volatile intptr_t* dest, intptr_t compare)
                * 将 dest* 指向的内容和 compare 比较
-               * 如果相同，则将 exchange 写入 dest* 指向的内容，返回没变动的 compare
-               * 如果不同，则将 dest* 指向的内容写入 compare，并返回 compare (mark)
+               * 如果相同，则将 exchange 写入 dest 指向的内容，返回没变动的 compare
+               * 如果不同，则将 dest 指向的内容写入 compare，并返回 compare
                *
                * 所以这里 if() 中如果为 true 则表示更变成功
                * false 表示更变失败
@@ -1936,7 +1944,12 @@ run:
                * 如果相同，header 写入 lockee->mark_addr()，true
                * 如果不同，将 lockee->mark_addr() 内容写入 mark，false
                *
-               * 也就是尝试将 锁对象保存的 Mark Word 替换为当前对象头的 Mark Word
+               * 也就是尝试将 header 写入 lockee->mark_addr()
+               *
+               * 注意这里的关系
+               * header = lockee->klass()->prototype_header() 原型对象头
+               * lockee->mark_addr() 指向栈中锁记录的指针
+               * mark = lockee->mark() 
                */
               if (Atomic::cmpxchg_ptr(header, lockee->mark_addr(), mark) == mark) {
                 if (PrintBiasedLockingStatistics)
@@ -1945,7 +1958,7 @@ run:
             }
             else if ((anticipated_bias_locking_value & epoch_mask_in_place) !=0) {
               // try rebias
-              markOop new_header = (markOop) ( (intptr_t) lockee->klass()->prototype_header() | thread_ident);
+              markOop new_header = (markOop) ((intptr_t) lockee->klass()->prototype_header() | thread_ident);
               if (hash != markOopDesc::no_hash) {
                 new_header = new_header->copy_set_hash(hash);
               }
