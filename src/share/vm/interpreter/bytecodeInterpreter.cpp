@@ -1939,23 +1939,25 @@ run:
                * 所以这里 if() 中如果为 true 则表示更变成功
                * false 表示更变失败
                *
-               * 当前作用：
-               * 将 lockee->mark_addr() 指向的内容和 mark 比较
-               * 如果相同，header 写入 lockee->mark_addr()，true
-               * 如果不同，将 lockee->mark_addr() 内容写入 mark，false
-               *
-               * 也就是尝试将 header 写入 lockee->mark_addr()
-               *
-               * 注意这里的关系
+               * 注意这里的关系：
+               * oop lockee (锁对象头)
                * header = lockee->klass()->prototype_header() 原型对象头
-               * lockee->mark_addr() 指向栈中锁记录的指针
-               * mark = lockee->mark() 
+               * markOop mark = lockee->mark() 锁对象头中的锁记录
+               * lockee->mark_addr() = (markOop*) &_mark 指向 mark 的指针
+               *
+               * 当前作用：
+               * 将 lockee->mark_addr() 指向的内容和当前 mark 比较
+               * 如果相同，表示锁未被其他获取
+               * header 写入 lockee->mark_addr()，返回 mark，true
+               * 如果不同，将 lockee->mark_addr() 内容写入 mark，返回 mark，false
+               * 也就是尝试将 header 写入 lockee->mark_addr()
                */
               if (Atomic::cmpxchg_ptr(header, lockee->mark_addr(), mark) == mark) {
                 if (PrintBiasedLockingStatistics)
                   (*BiasedLocking::revoked_lock_entry_count_addr())++;
               }
             }
+            //
             else if ((anticipated_bias_locking_value & epoch_mask_in_place) !=0) {
               // try rebias
               markOop new_header = (markOop) ((intptr_t) lockee->klass()->prototype_header() | thread_ident);
