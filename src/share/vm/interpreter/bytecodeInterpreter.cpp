@@ -1878,6 +1878,7 @@ run:
           entry->set_obj(lockee);
           int success = false;
 
+          // epoch 掩码
           uintptr_t epoch_mask_in_place = (uintptr_t)markOopDesc::epoch_mask_in_place;
 
           // 获取锁对象的对象头（主要存储了 Mark Word）
@@ -1941,40 +1942,55 @@ run:
                *
                * 注意这里的关系：
                * oop lockee (锁对象头)
-               * header = lockee->klass()->prototype_header() 原型对象头
-               * markOop mark = lockee->mark() 锁对象头中的锁记录
-               * lockee->mark_addr() = (markOop*) &_mark 指向 mark 的指针
+               * header = lockee->klass()->prototype_header() 返回 _prototype_header:
+               * 在此类型启用和禁用偏向锁定时使用
+               *
+               * markOop mark = lockee->mark() 锁对象头中的 mark word
+               * lockee->mark_addr() = (markOop*) &_mark 锁对象头中的 mark word 的指针
                *
                * 当前作用：
                * 将 lockee->mark_addr() 指向的内容和当前 mark 比较
                * 如果相同，表示锁未被其他获取
                * header 写入 lockee->mark_addr()，返回 mark，true
                * 如果不同，将 lockee->mark_addr() 内容写入 mark，返回 mark，false
-               * 也就是尝试将 header 写入 lockee->mark_addr()
+               *
+               * 也就是尝试将当前线程的 header 写入 lockee->mark_addr()
+               * 即尝试将锁对象的 mark_word 指针指向 当前线程的 mark_word
                */
               if (Atomic::cmpxchg_ptr(header, lockee->mark_addr(), mark) == mark) {
                 if (PrintBiasedLockingStatistics)
                   (*BiasedLocking::revoked_lock_entry_count_addr())++;
               }
             }
-            //
+            // 预期偏向锁值 和 epoch 掩码 与操作，不为 0 则表示过期
             else if ((anticipated_bias_locking_value & epoch_mask_in_place) !=0) {
               // try rebias
+              // 尝试重偏向
+              // 获取 lockee 偏向当前线程的 新原型对象头（原型对象头 与 线程id 按位或操作）
               markOop new_header = (markOop) ((intptr_t) lockee->klass()->prototype_header() | thread_ident);
+              // 与上面 header 操作同理
               if (hash != markOopDesc::no_hash) {
                 new_header = new_header->copy_set_hash(hash);
               }
+              /**
+               * 尝试将当前线程的 new_header 写入 lockee->mark_addr()
+               * 即尝试将锁对象的 mark_word 指针 lockee->mark_addr()
+               * 指向 当前线程的 mark_word (new_header)
+               */
               if (Atomic::cmpxchg_ptr((void*)new_header, lockee->mark_addr(), mark) == mark) {
                 if (PrintBiasedLockingStatistics)
                   (* BiasedLocking::rebiased_lock_entry_count_addr())++;
               }
               else {
+                // 失败表示多个线程同时竞争，锁升级
                 CALL_VM(InterpreterRuntime::monitorenter(THREAD, entry), handle_exception);
               }
               success = true;
             }
             else {
               // try to bias towards thread in case object is anonymously biased
+              // 进入这里的逻辑代表当前要么偏向其他线程，要么是匿名偏向
+              // 因此这里处理匿名偏向的 case，构建匿名偏向的 mark word
               markOop header = (markOop) ((uintptr_t) mark & ((uintptr_t)markOopDesc::biased_lock_mask_in_place |
                                                               (uintptr_t)markOopDesc::age_mask_in_place |
                                                               epoch_mask_in_place));
@@ -1984,11 +2000,14 @@ run:
               markOop new_header = (markOop) ((uintptr_t) header | thread_ident);
               // debugging hint
               DEBUG_ONLY(entry->lock()->set_displaced_header((markOop) (uintptr_t) 0xdeaddead);)
+              // 同上面一样，尝试将锁对象的 mark_word 指针 lockee->mark_addr()
+              // 指向当前线程的 mark_word (new_header)
               if (Atomic::cmpxchg_ptr((void*)new_header, lockee->mark_addr(), header) == header) {
                 if (PrintBiasedLockingStatistics)
                   (* BiasedLocking::anonymously_biased_lock_entry_count_addr())++;
               }
               else {
+                // 锁升级
                 CALL_VM(InterpreterRuntime::monitorenter(THREAD, entry), handle_exception);
               }
               success = true;
@@ -1996,15 +2015,32 @@ run:
           }
 
           // traditional lightweight locking
+          // 传统轻量级锁
           if (!success) {
+            // 不成功则进入
+            // 构造无锁状态的 displaced mark word
             markOop displaced = lockee->mark()->set_unlocked();
+            /**
+             * 空闲锁记录 (BasicObjectLock) 的 lock() 方法 会返回
+             * new BasicLock(addr.addOffsetTo(lockField.getOffset()))
+             * 内部存有 _displaced_header，可以理解为 对象头或 mark word
+             *
+             * 这里拿到空闲锁记录 BasicLock，将 displaced mark word 赋进去
+             */
             entry->lock()->set_displaced_header(displaced);
+            // 是否使用重量级锁
             bool call_vm = UseHeavyMonitors;
+            // 熟悉的老套路，使用 cmpxchg_ptr 进行 CAS 替换
+            // 先判断是否使用重量级锁，如果 call_vm 为 true 会直接进入 CALL_VM 部分
+            // 如果轻量级锁加锁成功，则进入判断是否锁重入，轻量级锁的锁重入使用 Lock Record 的数量记录
             if (call_vm || Atomic::cmpxchg_ptr(entry, lockee->mark_addr(), displaced) != displaced) {
               // Is it simple recursive case?
+              // 检测是否简单的重入情况
               if (!call_vm && THREAD->is_lock_owned((address) displaced->clear_lock_bits())) {
+                // 如果锁重入，将 displaced mark word 设为 null
                 entry->lock()->set_displaced_header(NULL);
               } else {
+                // 锁升级
                 CALL_VM(InterpreterRuntime::monitorenter(THREAD, entry), handle_exception);
               }
             }
