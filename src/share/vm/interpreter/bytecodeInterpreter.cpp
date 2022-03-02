@@ -1941,12 +1941,12 @@ run:
                * false 表示更变失败
                *
                * 注意这里的关系：
-               * oop lockee (锁对象头)
+               * oop lockee (锁对象)
                * header = lockee->klass()->prototype_header() 返回 _prototype_header:
                * 在此类型启用和禁用偏向锁定时使用
                *
-               * markOop mark = lockee->mark() 锁对象头中的 mark word
-               * lockee->mark_addr() = (markOop*) &_mark 锁对象头中的 mark word 的指针
+               * markOop mark = lockee->mark() 锁对象中的 mark word
+               * lockee->mark_addr() = (markOop*) &_mark 锁对象中的 mark word 的指针
                *
                * 当前作用：
                * 将 lockee->mark_addr() 指向的内容和当前 mark 比较
