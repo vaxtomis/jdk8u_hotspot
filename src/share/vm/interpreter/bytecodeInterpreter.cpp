@@ -1895,15 +1895,22 @@ run:
             thread_ident = (uintptr_t)istate->thread();
 
             anticipated_bias_locking_value =
-              // 1. 对当前锁对象 class 的 prototype_header 和 线程id 进行 或运算
+              // 1. 对当前锁对象 class 的 prototype_header (原始的头部信息)
+              // 和 线程id 进行 或运算，相当于将 线程信息 放到 原始头部中
               // prototype_header (epoch + 分代年龄 + 锁偏向标志 + 锁标志位)
               (((uintptr_t)lockee->klass()->prototype_header() | thread_ident)
               // 2. 拿锁对象的 对象头 进行 异或运算
+              // 如果当前线程持有锁，线程 ID 的几位则为 0
               ^ (uintptr_t)mark)
-              // 3. 获取 age_mask_in_place 掩码，取反并与 之前的运算结果进行 与运算
+              // 3. 获取 age_mask_in_place (二进制 1111 000)，取反 0000 111
+              // 与之前的运算结果进行 与运算 (遮盖分代年龄 0000，保留锁的 111)
+              // 这一步用于去除年龄位，保留锁位和其他，去掉 GC 的影响
               & ~((uintptr_t) markOopDesc::age_mask_in_place);
 
             // 偏向的线程是否为当前线程
+            // anticipated_bias_locking_value == 0 说明
+            // prototype_header | thread_id 的后三位与 mark 后三位以及 epoch 相同
+            // 表明偏向的线程为当前线程
             if  (anticipated_bias_locking_value == 0) {
               // already biased towards this thread, nothing to do
               // 打印偏向锁定统计信息
@@ -1912,11 +1919,14 @@ run:
               }
               success = true;
             }
-            // 预期偏向锁值 与 biased_lock_mask_in_place 做 与运算（忽略我们不在意的部分）
-            // 不为 0 表示 prototype_header 不是偏向模式
+            // 预期偏向锁值 与 biased_lock_mask_in_place (二进制 111) 做 与运算
+            // 结果不为 0
+            // 这里 mark 后三位为 101，prototype_header 与 101 异或 不为 0
+            // 因此 prototype_header 不为 101，但偏向锁和标志位正是 101
+            // 表示 prototype_header 不是偏向锁
             else if ((anticipated_bias_locking_value & markOopDesc::biased_lock_mask_in_place) != 0) {
               // try revoke bias
-              // 获取 锁对象 的原型对象头
+              // 因为没有开启偏向锁，因此获取 锁对象 的原型（无偏向锁）对象头
               markOop header = lockee->klass()->prototype_header();
               // 如果 hash 不为 0（这里 no_hash = 0），则对 对象头做处理 并返回
               if (hash != markOopDesc::no_hash) {
@@ -1950,12 +1960,13 @@ run:
                *
                * 当前作用：
                * 将 lockee->mark_addr() 指向的内容和当前 mark 比较
-               * 如果相同，表示锁未被其他获取
+               * 如果相同，表示锁未被其他线程获取
                * header 写入 lockee->mark_addr()，返回 mark，true
-               * 如果不同，将 lockee->mark_addr() 内容写入 mark，返回 mark，false
+               * 如果不同，将 lockee->mark_addr() 指向的对象写入 mark，返回 mark，false
                *
-               * 也就是尝试将当前线程的 header 写入 lockee->mark_addr()
-               * 即尝试将锁对象的 mark_word 指针指向 当前线程的 mark_word
+               * 当然，通常来说 锁对象的 mark word 指针都是指向当前 mark word
+               * 如果其他线程没有进入并进行修改，就用处理过的 prototype_header 替换
+               * 类似于初始化 锁对象 的对象头
                */
               if (Atomic::cmpxchg_ptr(header, lockee->mark_addr(), mark) == mark) {
                 if (PrintBiasedLockingStatistics)
@@ -1973,9 +1984,9 @@ run:
                 new_header = new_header->copy_set_hash(hash);
               }
               /**
-               * 尝试将当前线程的 new_header 写入 lockee->mark_addr()
-               * 即尝试将锁对象的 mark_word 指针 lockee->mark_addr()
-               * 指向 当前线程的 mark_word (new_header)
+               * 如果 mark_addr 指向对象 和 mark 相同
+               * 将当前线程的 new_header 写入 lockee->mark_addr()
+               * 不同，将 lockee->mark_addr() 指向的对象 写入 mark
                */
               if (Atomic::cmpxchg_ptr((void*)new_header, lockee->mark_addr(), mark) == mark) {
                 if (PrintBiasedLockingStatistics)
