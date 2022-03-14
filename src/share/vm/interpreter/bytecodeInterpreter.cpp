@@ -2045,7 +2045,8 @@ run:
             bool call_vm = UseHeavyMonitors;
             // 熟悉的老套路，使用 cmpxchg_ptr 进行 CAS 替换
             // 先判断是否使用重量级锁，如果 call_vm 为 true 会直接进入 CALL_VM 部分
-            // 如果轻量级锁加锁成功，则进入判断是否锁重入，轻量级锁的锁重入使用 Lock Record 的数量记录
+            // 如果 CAS 替换不成功，代表对象不是无锁状态
+            // 则进入判断是否锁重入，轻量级锁的锁重入使用 Lock Record 的数量记录
             if (call_vm || Atomic::cmpxchg_ptr(entry, lockee->mark_addr(), displaced) != displaced) {
               // Is it simple recursive case?
               // 检测是否简单的重入情况
