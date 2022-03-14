@@ -1921,9 +1921,9 @@ run:
             }
             // 预期偏向锁值 与 biased_lock_mask_in_place (二进制 111) 做 与运算
             // 结果不为 0
-            // 这里 mark 后三位为 101，prototype_header 与 101 异或 不为 0
-            // 因此 prototype_header 不为 101，但偏向锁和标志位正是 101
-            // 表示 prototype_header 不是偏向锁
+            // 这里 mark 后三位为 101，要求 prototype_header 与 101 异或 不为 0
+            // 等价于要求 prototype_header 不为 101，（偏向锁和标志位正是 101）
+            // 等价于要求 prototype_header 不是偏向锁
             else if ((anticipated_bias_locking_value & markOopDesc::biased_lock_mask_in_place) != 0) {
               // try revoke bias
               // 因为没有开启偏向锁，因此获取 锁对象 的原型（无偏向锁）对象头
