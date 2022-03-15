@@ -223,23 +223,33 @@ void ObjectSynchronizer::fast_exit(oop object, BasicLock* lock, TRAPS) {
 // This routine is used to handle interpreter/compiler slow case
 // We don't need to use fast path here, because it must have been
 // failed in the interpreter/compiler code.
+// 进入当前逻辑说明 快速加锁流程失败了
+// 多个线程同时竞争锁时进入
 void ObjectSynchronizer::slow_enter(Handle obj, BasicLock* lock, TRAPS) {
+  // 拿到对象 mark word
   markOop mark = obj->mark();
+  // 声明禁用了偏向锁
   assert(!mark->has_bias_pattern(), "should not see bias pattern here");
 
+  // 如果当前是无锁状态
   if (mark->is_neutral()) {
     // Anticipate successful CAS -- the ST of the displaced mark must
     // be visible <= the ST performed by the CAS.
+    // 将当前的 mark word 设置到 displaced mark word
     lock->set_displaced_header(mark);
+    // CAS 替换加锁，如果成功就 return
     if (mark == (markOop) Atomic::cmpxchg_ptr(lock, obj()->mark_addr(), mark)) {
       TEVENT (slow_enter: release stacklock) ;
       return ;
     }
     // Fall through to inflate() ...
-  } else
-  if (mark->has_locker() && THREAD->is_lock_owned((address)mark->locker())) {
+    // 进入膨胀逻辑
+  }
+  // 如果为锁重入的情况
+  else if (mark->has_locker() && THREAD->is_lock_owned((address)mark->locker())) {
     assert(lock != mark->locker(), "must not re-lock the same lock");
     assert(lock != (BasicLock*)obj->mark(), "don't relock with same BasicLock");
+    // 锁重入时需要设定 displaced mark word 为 null
     lock->set_displaced_header(NULL);
     return;
   }
@@ -256,6 +266,8 @@ void ObjectSynchronizer::slow_enter(Handle obj, BasicLock* lock, TRAPS) {
   // so it does not matter what the value is, except that it
   // must be non-zero to avoid looking like a re-entrant lock,
   // and must not look locked either.
+  // 对象头永远不会被置换到这个锁，所以它的值是什么并不重要，
+  // 但它必须非零以避免被误认为可重入锁，并且也不能看起来像已被锁。
   lock->set_displaced_header(markOopDesc::unused_mark());
   ObjectSynchronizer::inflate(THREAD, obj())->enter(THREAD);
 }
