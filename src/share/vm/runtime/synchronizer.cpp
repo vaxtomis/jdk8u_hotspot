@@ -167,18 +167,21 @@ static volatile int MonitorPopulation = 0 ;      // # Extant -- in circulation
 
 void ObjectSynchronizer::fast_enter(Handle obj, BasicLock* lock, bool attempt_rebias, TRAPS) {
  if (UseBiasedLocking) {
+    // 启用偏向锁，当不在全局安全点时
     if (!SafepointSynchronize::is_at_safepoint()) {
       BiasedLocking::Condition cond = BiasedLocking::revoke_and_rebias(obj, attempt_rebias, THREAD);
       if (cond == BiasedLocking::BIAS_REVOKED_AND_REBIASED) {
         return;
       }
-    } else {
+    }
+    // 在全局安全点时
+    else {
       assert(!attempt_rebias, "can not rebias toward VM thread");
       BiasedLocking::revoke_at_safepoint(obj);
     }
     assert(!obj->mark()->has_bias_pattern(), "biases should be revoked by now");
  }
-
+ // fast_enter 未处理成功，转入 slow_enter 继续处理
  slow_enter (obj, lock, THREAD) ;
 }
 
