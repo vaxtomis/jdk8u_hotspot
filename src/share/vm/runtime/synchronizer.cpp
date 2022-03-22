@@ -1224,14 +1224,15 @@ ObjectMonitor * ATTR ObjectSynchronizer::inflate (Thread * Self, oop object) {
       assert (!mark->has_bias_pattern(), "invariant") ;
 
       // The mark can be in one of the following states:
-      // *  Inflated     - just return
-      // *  Stack-locked - coerce it to inflated
-      // *  INFLATING    - busy wait for conversion to complete
-      // *  Neutral      - aggressively inflate the object.
-      // *  BIASED       - Illegal.  We should never see this
+      // *  Inflated 重量级锁     - just return 返回
+      // *  Stack-locked 轻量级锁 - coerce it to inflated 膨胀
+      // *  INFLATING 膨胀中   - busy wait for conversion to complete 等待
+      // *  Neutral 无锁     - aggressively inflate the object. 膨胀
+      // *  BIASED 偏向锁      - Illegal.  We should never see this 非法情况
 
-      // CASE: inflated
+      // CASE: inflated 重量级锁
       if (mark->has_monitor()) {
+          // 基本就是直接获取并返回
           ObjectMonitor * inf = mark->monitor() ;
           assert (inf->header()->is_neutral(), "invariant");
           assert (inf->object() == object, "invariant") ;
@@ -1240,26 +1241,33 @@ ObjectMonitor * ATTR ObjectSynchronizer::inflate (Thread * Self, oop object) {
       }
 
       // CASE: inflation in progress - inflating over a stack-lock.
-      // Some other thread is converting from stack-locked to inflated.
-      // Only that thread can complete inflation -- other threads must wait.
-      // The INFLATING value is transient.
-      // Currently, we spin/yield/park and poll the markword, waiting for inflation to finish.
+      // 在轻量级锁中膨胀
+      // 其他线程正在膨胀此对象的轻量级锁
+      // 只有正在执行膨胀的线程可以完成膨胀操作，其他线程必须等待
+      // INFLATING 标志会转变
+      // 我们通过 spin/yield/park 和轮询等一系列操作，等待膨胀结束
       // We could always eliminate polling by parking the thread on some auxiliary list.
+      // 我们总是可以通过将线程停在某个辅助列表上来消除轮询
       if (mark == markOopDesc::INFLATING()) {
+         // 其他线程在操作此对象执行锁膨胀，自旋重试
          TEVENT (Inflate: spin while INFLATING) ;
          ReadStableMark(object) ;
          continue ;
       }
 
       // CASE: stack-locked
-      // Could be stack-locked either by this thread or by some other thread.
-      //
+      // 可以同时被当前线程和其他线程加轻量级锁
+
       // Note that we allocate the objectmonitor speculatively, _before_ attempting
       // to install INFLATING into the mark word.  We originally installed INFLATING,
       // allocated the objectmonitor, and then finally STed the address of the
       // objectmonitor into the mark.  This was correct, but artificially lengthened
       // the interval in which INFLATED appeared in the mark, thus increasing
       // the odds of inflation contention.
+      //
+      // 注意，我们推测性地分配了对象监视器，_before_ 试图给 mark word 标记 INFLATING
+      // 我们最初标记的 INFLATING，分配了对象监视器，最后将对象监视器的地址 STed 到了 mark 中
+      // 这个过程人为地延长了 INFLATED 出现在标记中的间隔，从而增加了膨胀争用的几率
       //
       // We now use per-thread private objectmonitor free lists.
       // These list are reprovisioned from the global free list outside the
@@ -1269,6 +1277,12 @@ ObjectMonitor * ATTR ObjectSynchronizer::inflate (Thread * Self, oop object) {
       // Using such local free lists, it doesn't matter if the omAlloc() call appears
       // before or after the CAS(INFLATING) operation.
       // See the comments in omAlloc().
+      //
+      // 现在我们使用线程私有的对象监视器空闲列表（本地空闲列表）
+      // 这个表格是从 INFLATING...ST 间隔之外的全局空闲列表中重新配置的
+      // 一个线程可以将多个对象监视器从全局空闲列表整体传输到其本地空闲列表
+      // 这减少了全局空闲列表上的一致性流量和锁定争用
+      // 使用这样的本地空闲列表，omAlloc() 调用出现在 CAS(INFLATING) 操作之前还是之后都没有关系
 
       if (mark->has_locker()) {
           ObjectMonitor * m = omAlloc (Self) ;
