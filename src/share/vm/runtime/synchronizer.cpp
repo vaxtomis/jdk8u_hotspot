@@ -272,6 +272,7 @@ void ObjectSynchronizer::slow_enter(Handle obj, BasicLock* lock, TRAPS) {
   // 对象头永远不会被置换到这个锁，所以它的值是什么并不重要，
   // 但它必须非零以避免被误认为可重入锁，并且也不能看起来像已被锁。
   lock->set_displaced_header(markOopDesc::unused_mark());
+  // inflate 膨胀为重量级锁，调用 enter 进入
   ObjectSynchronizer::inflate(THREAD, obj())->enter(THREAD);
 }
 
@@ -1285,18 +1286,32 @@ ObjectMonitor * ATTR ObjectSynchronizer::inflate (Thread * Self, oop object) {
       // 使用这样的本地空闲列表，omAlloc() 调用出现在 CAS(INFLATING) 操作之前还是之后都没有关系
 
       if (mark->has_locker()) {
+          // 分配 ObjectMonitor
           ObjectMonitor * m = omAlloc (Self) ;
           // Optimistically prepare the objectmonitor - anticipate successful CAS
           // We do this before the CAS in order to minimize the length of time
           // in which INFLATING appears in the mark.
+
+          // 乐观地准备对象监视器
+          // 我们在 CAS 之前完成这些工作，目的是降低 INFLATING 出现在标记中的时长
+
+          // 对 ObjectMonitor 进行初始化
+          // Recycle() 定义在 objectMonitor.hpp 中，用途为初始化
           m->Recycle();
+          // objectMonitor.hpp 并未给出解释
+          // 根据 docs 得知是责任线程
           m->_Responsible  = NULL ;
+          // owner 是 线程 还是 SP/BasicLock（owner 可以是指向当前 Monitor 的线程 or BasicLock 的指针）
           m->OwnerIsThread = 0 ;
+          // 重入计数
           m->_recursions   = 0 ;
+          // 自旋周期时间
           m->_SpinDuration = ObjectMonitor::Knob_SpinLimit ;   // Consider: maintain by type/class
 
+          // 使用 CAS 将锁对象的 mark word 修改为 INFLATING
           markOop cmp = (markOop) Atomic::cmpxchg_ptr (markOopDesc::INFLATING(), object->mark_addr(), mark) ;
           if (cmp != mark) {
+             // 释放 om，继续循环重试
              omRelease (Self, m, true) ;
              continue ;       // Interference -- just retry
           }
@@ -1305,6 +1320,10 @@ ObjectMonitor * ATTR ObjectSynchronizer::inflate (Thread * Self, oop object) {
           // This is the only case where 0 will appear in a mark-work.
           // Only the singular thread that successfully swings the mark-word
           // to 0 can perform (or more precisely, complete) inflation.
+          //
+          // 我们已经成功将 INFLATING(0) 装载进 mark word
+          // 这是 0 出现在 mark word 的唯一情况
+          // 只有成功地将 mark word 变为 0 的单个线程才能执行（准确地说，完全）膨胀。
           //
           // Why do we CAS a 0 into the mark-word instead of just CASing the
           // mark-word from the stack-locked value directly to the new inflated state?
@@ -1326,15 +1345,39 @@ ObjectMonitor * ATTR ObjectSynchronizer::inflate (Thread * Self, oop object) {
           // Critically, while object->mark is 0 mark->displaced_mark_helper() is stable.
           // 0 serves as a "BUSY" inflate-in-progress indicator.
 
+          // 为什么我们要 CAS 一个 0 到 mark word 中，
+          // 而不是直接将 mark word 从堆栈锁定值 CAS 到新的膨胀状态？
+          // 我们必须考虑当线程解锁堆栈锁定对象时会发生什么。
+          // 它尝试使用 CAS 将 displaced header 从堆栈上的 basiclock 转换回对象头。
+          // header （hash code 等）可以驻留在：
+          // (a) 对象头中
+          // (b) 与堆栈锁关联的 displaced header 中
+          // (c) objectMonitor 中的 displaced header 中
+
+          // inflate() 事务必须将 header 从所有者堆栈上的 basiclock 复制到 objectMonitor，
+          // 同时保持 hashCode 的稳定。
+          // 如果 owner 决定在值为 0 时释放锁，则解锁将失败，控制最终将通过 slow_exit() 传递到 inflate。
+          // 然后 owner 将自旋，等待 0 值变化。
+          // 换句话说，如果 owner 碰巧在膨胀进行中尝试放弃锁（将 header 从 basiclock 恢复到对象），
+          // 则 0 会导致 owner 中止。
+          // 该协议避免了竞争可能会导致的对象 hashCode 值更改或 "闪烁" 。
+          // 至关重要的是，虽然 object->mark 为 0，但 mark->displaced_mark_helper() 是稳定的。
+
+          // 0 用作 "BUSY" 指示器，表明正在进行膨胀。
 
           // fetch the displaced mark from the owner's stack.
           // The owner can't die or unwind past the lock while our INFLATING
           // object is in the mark.  Furthermore the owner can't complete
           // an unlock on the object, either.
+
+          // 从 owner 线程的栈中获取 displaced mark
+          // 当我们的 INFLATING 对象在 displaced mark 中时，owner 线程不能死亡或挂起。
+          // 此外，owner 也无法完成对对象的解锁。
           markOop dmw = mark->displaced_mark_helper() ;
           assert (dmw->is_neutral(), "invariant") ;
 
           // Setup monitor fields to proper values -- prepare the monitor
+          // 将监视器字段设置为适当的值 - 准备监视器
           m->set_header(dmw) ;
 
           // Optimization: if the mark->locker stack address is associated
@@ -1342,17 +1385,24 @@ ObjectMonitor * ATTR ObjectSynchronizer::inflate (Thread * Self, oop object) {
           // m->OwnerIsThread = 1. Note that a thread can inflate an object
           // that it has stack-locked -- as might happen in wait() -- directly
           // with CAS.  That is, we can avoid the xchg-NULL .... ST idiom.
+
+          // 优化：如果 mark->locker 堆栈地址与该线程相关联，
+          // 我们可以简单地设置 m->_owner = Self 和 m->OwnerIsThread = 1。
+          // 请注意，线程可以对已被堆栈锁定的对象进行膨胀——如可能发生在 wait() 中——直接使用 CAS。
+          // 也就是说，我们可以避免 xchg-NULL .... ST。
           m->set_owner(mark->locker());
           m->set_object(object);
           // TODO-FIXME: assert BasicLock->dhw != 0.
 
           // Must preserve store ordering. The monitor state must
           // be stable at the time of publishing the monitor address.
+          // 必须保留存储顺序，监视器在发布其地址时状态必须保持稳定
           guarantee (object->mark() == markOopDesc::INFLATING(), "invariant") ;
           object->release_set_mark(markOopDesc::encode(m));
 
       // Hopefully the performance counters are allocated on distinct cache lines
       // to avoid false sharing on MP systems ...
+      // 理想上，性能计数器们被分配在不同的缓存行上，来避免 MP 系统的错误共享
       OM_PERFDATA_OP(Inflations, inc());
       TEVENT(Inflate: overwrite stacklock);
       if (TraceMonitorInflation) {
@@ -1367,6 +1417,8 @@ ObjectMonitor * ATTR ObjectSynchronizer::inflate (Thread * Self, oop object) {
     }
 
       // CASE: neutral
+      // 最后一种状态：无锁
+
       // TODO-FIXME: for entry we currently inflate and then try to CAS _owner.
       // If we know we're inflating for entry it's better to inflate by swinging a
       // pre-locked objectMonitor pointer into the object header.   A successful
@@ -1376,18 +1428,30 @@ ObjectMonitor * ATTR ObjectSynchronizer::inflate (Thread * Self, oop object) {
       // An inflateTry() method that we could call from fast_enter() and slow_enter()
       // would be useful.
 
+      // 如果我们知道我们正在对处理的入口进行膨胀逻辑，更好的办法是通过偏转
+      // 预锁定的 objectMonitor 指针进入对象头。
+      // CAS 操作成功后，会膨胀对象并赋予膨胀线程所有权
+      // 在当前实现中，我们使用两步机制：
+      // 1. CAS 操作进行膨胀
+      // 2. 再次 CAS 操作尝试偏转 _owner，使其从 NULL 转变为 Self
+      // 在 fast_enter() 和 slow_enter() 中调用 inflateTry() 是一种有效的方法
+
       assert (mark->is_neutral(), "invariant");
-      ObjectMonitor * m = omAlloc (Self) ;
+      ObjectMonitor * m = omAlloc (Self);
       // prepare m for installation - set monitor to initial state
+      // 初始化 objectMonitor
       m->Recycle();
       m->set_header(mark);
       m->set_owner(NULL);
       m->set_object(object);
+      // 这里 OwnerIsThread 不同了，表示 basicLock
       m->OwnerIsThread = 1 ;
       m->_recursions   = 0 ;
       m->_Responsible  = NULL ;
       m->_SpinDuration = ObjectMonitor::Knob_SpinLimit ;       // consider: keep metastats by type/class
 
+      // 用CAS替换对象头的 mark word 为重量级锁状态
+      // 失败则重试
       if (Atomic::cmpxchg_ptr (markOopDesc::encode(m), object->mark_addr(), mark) != mark) {
           m->set_object (NULL) ;
           m->set_owner  (NULL) ;

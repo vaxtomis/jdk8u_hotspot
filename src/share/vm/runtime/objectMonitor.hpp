@@ -144,7 +144,7 @@ class ObjectMonitor {
   ObjectMonitor() {
     _header       = NULL;
     _count        = 0;
-    _waiters      = 0,
+    _waiters      = 0,_Responsible
     _recursions   = 0;
     _object       = NULL;
     _owner        = NULL;
